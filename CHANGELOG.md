@@ -1,0 +1,461 @@
+# Changelog
+
+All notable changes to this project are documented here. Format loosely
+follows [Keep a Changelog](https://keepachangelog.com/), versioning follows
+[SemVer](https://semver.org/) once there's a tagged release.
+
+## [Unreleased]
+
+### Added (launcher and free ports, 2026-11-02)
+
+- `launch.py` with `Launch.bat`, `launch.sh` and a `.desktop` file: `up`
+  picks free host ports near 8000 (app) and 11434 (bundled Ollama), records
+  them in `~/.suite/ports.json` and starts the stack; `open` opens the
+  browser. With `OLLAMA_HOST` pointing at the host's Ollama, or
+  `LLM_PROVIDER=claude`, it starts only the app (`--no-deps app`).
+  `docker-compose.yml` publishes through `APP_HOST_PORT` /
+  `OLLAMA_HOST_PORT` (defaults unchanged); a pinned value with a host IP is
+  kept as written, and the host's `docker-compose.override.yml` is used.
+
+### Added (thumbnail views, 2026-10-28)
+
+- `POST /thumbnail` takes `view`: `iso` (default, unchanged), `top`,
+  `bottom` or `front`. an automated design shape check looks at faces the
+  three-quarter view hides, such as magnet pockets under a part. Checked with
+  Blender 4.3.2 in the running container.
+
+### Added (no keyword templates, 2026-10-28)
+
+- `POST /generate` takes `"use_templates": false`: the LLM writes the model
+  from the whole prompt instead of a built-in keyword template, and no cached
+  model is reused. an automated design jobs send detailed specs that mention
+  a "base plate" or a "case"; 12 of 16 were built as the stock plate (60 mm
+  wide, 3 mm thick) or box (40 × 20 mm) with only the first size taken.
+
+### Added (choose the backend, 2026-10-28)
+
+- `POST /generate` takes an optional `"backend"`: `openscad`, `cadquery` or
+  `blender`. It skips the classifier (`classification_method: "requested"`).
+  A long, detailed structural spec (a fleet design job's corner marker) was
+  classified complex and sent to Blender, whose script then failed; a caller
+  that knows the part is a box, tray or divider now asks for OpenSCAD. A
+  cached model from another backend isn't reused, and `cadquery` without its
+  sandbox is a 422.
+
+### Fixed (thumbnails, 2026-10-28)
+
+- `POST /thumbnail` failed on every model ("max() iterable argument is
+  empty"): render_thumbnail.py read its x/y/z generators twice (min, then
+  max). They're lists now. Checked with Blender 4.3.2 in the running
+  container on a fleet design job's OpenSCAD STL.
+
+### Added (miniatures bin and terrain tiles, 2026-10-19)
+
+- `gridfinity.make_minis_bin` and `POST /templates/minis-bin`: a Gridfinity
+  bin with one round socket per miniature base and optional magnet holes
+  under them; *Minis bin* tab on the templates page.
+- `terrain.py` and `POST /templates/terrain`: seeded terrain tiles (hills,
+  ridges, craters, mesas) with optional terraces, edges eased to the base
+  height so tiles join, and corner magnet holes; *Terrain* tab. The report
+  gives the share of the tile flat enough for a miniature.
+
+### Added (multi-colour 3MF, 2026-10-18)
+
+- `threemf.py`, `POST /models/{model_id}/export-3mf`,
+  `GET /models/{model_id}/multicolour.3mf` and a *Multi-colour 3MF* panel
+  on `templates.html`: one 3MF with a colour and filament slot per part,
+  in the layout Bambu Studio / OrcaSlicer / Elegoo Slicer read ("orca",
+  default) or PrusaSlicer's ("prusa"); see ADR 0015. PrusaSlicer output is
+  tested by slicing when `prusa-slicer` is installed. Dev dependency
+  `lib3mf` (BSD-2-Clause) for tests. .
+
+### Added (print templates, 2026-10-18)
+
+- `static/templates.html` and `POST /templates/{gridfinity-bin,gear,lithophane,qr-tag}`:
+  Gridfinity bins (compartments, stacking lip, label tabs, magnet holes;
+  `gridfinity.make_bin`), involute spur/helical gears with mating gear,
+  rack and a mesh report (`gear.py`, own code, no library), lithophanes
+  (flat/curved/cylinder with frame; `lithophane.py`, OpenCV decode) and
+  QR tags (text/URL/Wi-Fi, key-ring hole, NFC pocket, two-colour parts;
+  `qr_tag.py`). New dependency `segno` (BSD-3-Clause). Wi-Fi passwords are
+  not stored in the spec. .
+
+### Added (tool insert from a photo, 2026-10-18)
+
+- `tool_insert.py`, `POST /tool-insert/trace`, `POST /tool-insert` and
+  `static/tool-insert.html`: photograph tools on white paper with a dark
+  calibration square; the sheet is found and flattened (A4/Letter/A3/Legal
+  aspect), the square sets the scale, and each tool's outline is drawn for
+  editing (drag/add/remove points, finger notches, manual two-point scale).
+  The edited outlines become a fitted or Gridfinity tray with a pocket per
+  tool (clearance, depth, floor, stepped top chamfer). Gridfinity sizes and
+  feet in `gridfinity.py`, shared with the coming bin template. New
+  dependency `opencv-python-headless` (Apache-2.0). .
+
+### Added (overhang check, 2026-10-18)
+
+- Overhang highlighting: an **overhangs** toggle on `split.html`,
+  `spiral-wand.html` and `watertight.html` paints faces steeper than 45 deg
+  from vertical (adjustable on the split page) in red, ignoring faces on the
+  bed. Shared code in `static/viewer-kit.js` (`setOverhangs`).
+- `GET /models/{model_id}/overhangs`: overhang area, total area, fraction
+  and face count (`geometry.overhang_report`). .
+
+### Added (split to fit, 2026-10-18)
+
+- `split.py`, `POST /models/{model_id}/split`, `GET /models/{model_id}/split.zip`
+  and `static/split.html`: cut a model too big for a printer into pieces
+  that fit, with dowel holes (plus printed pins) or one-way D-pegs on every
+  cut face, and an assembled/exploded 3D view. Printer presets include the
+  Centauri Carbon, Bambu X1/P1/A1 mini, Prusa MK4, Sovol SV08, Ender 3 and
+  CR-10. Shared mesh helpers moved to `geometry.py`; shared viewer code to
+  `static/viewer-kit.js`. .
+
+### Added (spiral wand, 2026-10-11)
+
+- Spiral wand maker: `spiral_wand.py`, `POST /spiral-wand`,
+  `POST /models/{model_id}/spiral-wand/rider`,
+  `GET /models/{model_id}/parts/{filename}`,
+  `GET /models/{model_id}/spiral-wand.zip`, and the
+  `static/spiral-wand.html` GUI with a three.js viewer that animates the
+  rider spinning down the wand. Wand length, handle, rest gap ("handle
+  distance") and end cap (preset or any model) are configurable; riders
+  come from an upload, a prompt, or an existing model_id. New
+  dependencies: trimesh (MIT), manifold3d (Apache-2.0), networkx (BSD).
+  See `docs/adr/0014-spiral-wand-manifold3d.md`.
+
+### Added (docs refresh, 2026-10-04)
+
+- `docs/ARCHITECTURE.md`, `docs/AI_SETUP.md`, `CONTRIBUTING.md`,
+  `SECURITY.md`, `CODE_OF_CONDUCT.md`; README now has Windows and Linux/Mac
+  quick starts, a configuration table, and the `/transcribe` endpoint;
+  `GettingStarted.md` and `TROUBLESHOOTING.md` corrected (compose
+  `OLLAMA_HOST` fallback, Ollama model/timeout, CadQuery and `/transcribe`
+  failure modes).
+
+### Changed (dependencies and CI, 2026-10-01 to 2026-10-04)
+
+- dependency bumps to clear pip-audit findings (FastAPI/Starlette,
+  python-multipart, requests, dev tools).
+- `.github/workflows/security.yml` (gitleaks over full
+  history, pip-audit, npm audit), `.gitleaks.toml`, `.pre-commit-config.yaml`.
+
+### Added (voice dictation, 2026-09-29)
+
+- `POST /transcribe`: local faster-whisper speech-to-text
+  (`WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`,
+  `WHISPER_MODEL_DIR`, `MAX_AUDIO_UPLOAD_BYTES`) for the farm manager's AI
+  Model Generator interview.
+
+### Fixed (2026-09-29)
+
+- `OLLAMA_HOST` no longer defaults to an address unreachable from Docker:
+  `docker-compose.yml` now uses `${OLLAMA_HOST:-http://ollama:11434}` and
+  `.env.example` ships the variable commented out.
+
+### Added (sandboxed CadQuery backend, 2026-10-01)
+
+- `src/threedprompt/cadquery_gen/`: LLM-written CadQuery code runs in a
+  sandboxed subprocess (Landlock: writes only in the output folder, no
+  exec, TCP denied on ABI 4+; seccomp: `socket()` fails on any kernel;
+  audit hook: no sockets, subprocesses or ctypes; CPU, memory and
+  file-size rlimits; empty environment). The exported STL must pass the
+  watertight check, with one LLM retry. Refuses to run without Landlock.
+- `POST /generate` routes simple prompts with no OpenSCAD template to
+  CadQuery (`SIMPLE_LLM_BACKEND=cadquery`, the default), falling back to
+  LLM-authored OpenSCAD where the sandbox can't run. New dependency
+  `cadquery==2.8.0` (Apache-2.0; OCCT kernel LGPL-2.1 with exception); new
+  settings `SIMPLE_LLM_BACKEND`, `CADQUERY_MEMORY_LIMIT_MB`.
+
+### Added (intake mesh check support, 2026-09-27)
+
+- `POST /models/{model_id}/analyze` now returns `self_intersection_count`
+  (BVH overlap of face pairs not sharing a vertex, as in Blender's 3D-Print
+  Toolbox) and `mesh_volume_cm3` (bmesh enclosed volume; `null` for a
+  non-watertight mesh).
+- `POST /models/{model_id}/repair` accepts `{"auto_repair": true}`: re-analyzes,
+  closes only `likely_defect` holes, recalculates normals (so flipped regions
+  are fixed even with no holes to close), reports `skipped_hole_ids` and
+  `changed`. `hole_ids` and `auto_repair` are mutually exclusive.
+
+### Merged (2026-09-27)
+
+- `chore/ci-vendor-lint-and-archive-tools`: vendored `rhino3dm_reader`
+  excluded from ruff/black; four `str, Enum` classes -> `StrEnum`. CI lint
+  is green again.
+- `feature/freecad-backend`: FreeCAD backend, `/thumbnail`, `/tags/suggest`
+  (entries below). Its ADRs were renumbered 0005/0006 -> 0012/0013 to
+  avoid colliding with the mold ADRs that landed on `main` first.
+
+### Docs (2026-09-27 docs-vs-code review)
+
+- Rewrote `GettingStarted.md` and `Requirements.md`, which still described
+  an empty repo; README now covers `.3dm` input, `quad_target_faces`, the
+  vendored import_3dm/rhino3dm licenses, and the known red CI lint job.
+
+### Added (Rhino .3dm input + QuadriFlow retopology, 2026-09-09)
+
+- `.3dm` uploads for `/thicken`, `/mold` and `/watertight/upload`, read
+  inside Blender by a vendored MIT copy of import_3dm v0.0.18
+  (`blender_scripts/vendor/rhino3dm_reader/`); the Docker image installs
+  `rhino3dm` for Blender's Python. Rhino units are converted to mm.
+- Optional `quad_target_faces` on both thicken endpoints (QuadriFlow
+  retopology after shelling).
+
+### Added (geometry-aware vent placement - Phase 7 of the mold research plan)
+
+- Vent-hole placement (all four modes) now detects a real trapped-air
+  pocket - the cavity's own highest local surface peak, excluding
+  purely-vertical wall edges so a flat-topped box's corners don't falsely
+  register as peaks - instead of always cutting the vent at a fixed
+  `0.35 * cavity_size` offset from the cavity center. Falls back to that
+  same fixed offset when there's no real cavity mesh to analyze
+  (`silicone_block`'s synthetic box cavity) or no genuine peak survives
+  (a plain box's flat top, or a peak too close to the sprue to be worth a
+  separate vent) - every already-shipped, boxy model produces the exact
+  same mold as before this phase.
+- `docs/adr/0011-geometry-aware-vent-placement.md` records the local-
+  maximum definition (and the flat-box false positive it took to get
+  there right), the fixed-offset fallback design, why only the single
+  highest peak is vented rather than one vent per pocket (scoped down
+  from full Moldboxer-style multi-pillar parity as this phase's own
+  lowest-priority framing calls for), and the ray-cast-based live
+  verification proving the vent actually moves for a real bump.
+
+### Added (configurable parting axis/offset + casting-volume reporting - Phase 6 of the mold research plan)
+
+- `MoldRequest.parting_axis` (`"x"`/`"y"`/`"z"`, default `"z"`) picks which
+  model axis the two halves split along, for all four modes. Implemented
+  as a one-time rotation baked into the imported model's own mesh before
+  any other geometry code runs (`_rotate_axis_to_z()`), so every builder
+  keeps hardcoding "Z" internally - a non-`z` axis means the exported
+  parts stay in that rotated working frame rather than the upload's
+  original orientation (documented in `make_mold.py`'s and `mold.py`'s
+  troubleshooting notes).
+- `MoldRequest.parting_offset_mm` (default `0.0`) shifts the parting
+  plane away from the model's own bounding-box midpoint along
+  `parting_axis`, for all four modes - rejected with a clear error if it
+  would push the split outside the model's own range.
+- `MoldResponse.cavity_volume_cm3` (always populated) and
+  `MoldResponse.estimated_cast_mass_g` (populated only when the new,
+  optional `MoldRequest.material_density_g_per_cm3` request field is
+  given) report the actual pour/cast material volume and its estimated
+  mass - meaning differs per mode (see
+  `docs/adr/0010-configurable-parting-axis-and-volume-reporting.md`):
+  `silicone_block`'s pour-box cavity, `direct_cast`/`hollow_cast`'s own
+  model volume (minus the core's, for `hollow_cast`), `form_fitting`'s
+  thin shell gap. Surfaced as `X-Cavity-Volume-Cm3` /
+  `X-Estimated-Cast-Mass-G` headers on `POST /mold`.
+- `docs/adr/0010-configurable-parting-axis-and-volume-reporting.md`
+  records the rotate-then-build design, why `parting_offset_mm` is
+  validated against the model's own bbox rather than each mode's larger
+  cavity, a real `_add_registration_keys()` bug found and fixed along the
+  way (it assumed the cavity's own Z center was always the parting line,
+  which an offset breaks), and per-mode volume-formula definitions - plus
+  a follow-up correction documenting a second, pre-existing bug this
+  phase's own tests caught: `_add_pour_holes()` could silently punch away
+  a mold's entire ceiling instead of a hole when the sprue/vent diameter
+  wasn't meaningfully smaller than the cavity's own footprint (now a
+  rejected, clearly-named error instead of silently broken geometry).
+
+### Added (hollow/vessel inner-core mold mode - Phase 5 of the mold research plan)
+
+- `MoldRequest.mode` now also accepts `"hollow_cast"` - the same rigid
+  two-part outer mold as `direct_cast` (`hollow_cast_bottom.stl` /
+  `hollow_cast_top.stl`) plus a separate solid core
+  (`hollow_cast_core.stl`) - the model's own surface shrunk inward by
+  the new `cast_wall_thickness_mm` field, using the same
+  `_offset_model_along_normals()` helper `form_fitting` introduced (run
+  with a negative offset here). Seat the core inside the bottom half's
+  cavity before closing the top half and pouring, so the cast forms a
+  hollow shell instead of a solid block - for casting vessels (vases,
+  cups) without wasting material on a solid center.
+- `docs/adr/0009-hollow-vessel-inner-core-mode.md` records the design
+  (no new boolean operation needed - the core is just a smaller solid
+  nested in the same model-shaped cavity `direct_cast` already builds;
+  `_build_direct_cast_halves()` extracted from `direct_cast`'s builder so
+  both modes share it) and the corner-rounding/self-intersection
+  limitations inherited from reusing form_fitting's offset technique in
+  the inward direction.
+
+### Added (form-fitting thin-shell mold mode - Phase 4 of the mold research plan)
+
+- `MoldRequest.mode` now also accepts `"form_fitting"` - a thin,
+  contour-following silicone skin-pour tool (`skin_pour_bottom.stl` /
+  `skin_pour_top.stl`) plus a matching rigid support jacket
+  (`support_jacket_bottom.stl` / `support_jacket_top.stl`), 4 parts
+  total, for organic/detailed models a rigid `direct_cast` mold couldn't
+  release along any single axis. Both tools share one cavity shape - the
+  model's surface grown outward by the new `shell_thickness_mm` field -
+  since that offset surface is the finished silicone shell's own outer
+  face. New `skin_pour_wall_mm` / `support_jacket_wall_mm` request
+  fields.
+- `docs/adr/0008-form-fitting-thin-shell-mold.md` records the design
+  (per-vertex-normal-offset technique chosen over a Solidify-modifier
+  approach, the shared-cavity-shape insight reused from
+  `silicone_block`'s pour-box/clamp-shell split, and the corner-rounding
+  limitation found and verified live: flat/curved regions grow by exactly
+  `shell_thickness_mm`, but sharp corners/edges are under-grown since
+  their vertex normal averages several face normals rather than being
+  perpendicular to any one face).
+
+### Added (draft-angle/undercut analysis - Phase 3 of the mold research plan)
+
+- `POST /models/{model_id}/mold/draft-check` reports which faces of a
+  model would prevent a *rigid* two-part mold from releasing cleanly
+  along a given pull axis - a deterministic dot-product heuristic (no
+  LLM/ML), read-only, generates no files.
+  `src/threedprompt/draft_analysis.py` / `src/threedprompt/blender_scripts/analyze_draft.py`.
+- `POST /models/{model_id}/mold` and `POST /mold` now run this
+  automatically (non-blocking) after generating a `direct_cast` mold,
+  surfaced as `draft_check` in the JSON response or the
+  `X-Draft-Releasable` / `X-Draft-Problem-Island-Count` headers - a rigid
+  mold can't flex around an undercut the way `silicone_block`'s silicone
+  step can.
+- `docs/adr/0007-draft-undercut-analysis.md` records the design (why
+  draft angle is measured per-half against that half's own pull
+  direction rather than one global direction, the island-grouping reuse
+  from `analyze_watertight.py`, and why it's non-blocking for
+  `direct_cast` and not run automatically at all for `silicone_block`).
+
+### Added (auto mesh repair before mold generation - Phase 2 of the mold research plan)
+
+- `POST /models/{model_id}/mold` and `POST /mold` now run
+  `watertight.analyze_mesh()` on the input before generating anything;
+  holes the existing classifier heuristic confidently calls likely
+  defects are auto-repaired via `watertight.repair_mesh()`, and anything
+  left open (ambiguous/intentional-looking holes, non-manifold junction
+  edges) fails the request with a clear `MoldError` instead of handing
+  Blender's boolean solver broken geometry. Which holes were repaired (if
+  any) is surfaced as `repaired_hole_ids` in the JSON response /
+  `X-Repaired-Hole-Ids` header, not silently.
+
+### Planning (no code changes)
+
+- `docs/mold-production-research-and-plan.md` - research into 3D-printed
+  mold production techniques (direct-cast rigid molds vs. silicone-
+  intermediate casting vs. thin form-fitting shells) and a feature survey
+  of Moldboxer, Mold Studio, and SolidWorks 3D Mold Creator, translated
+  into numbered requirements and a phased development plan for what this
+  project's mold feature doesn't cover yet.
+
+### Added (direct-cast mold mode - Phase 1 of the mold research plan)
+
+- `MoldRequest.mode` (`"silicone_block"` default, or `"direct_cast"`) on
+  `POST /models/{model_id}/mold` and `POST /mold` - `direct_cast` produces
+  a single rigid two-part mold (`direct_mold_bottom.stl` /
+  `direct_mold_top.stl`) whose cavity is the model's own mesh geometry,
+  for casting resin/urethane/foam directly with no silicone step. Bolted
+  flange (reused from the clamp shell), no registration keys, no separate
+  clamp shell. New `direct_mold_wall_mm` request field.
+- `docs/adr/0006-direct-cast-mold-mode.md` records the design (model-mesh-
+  as-cavity-tool instead of a box, and why draft angle, release tolerance,
+  and registration keys were all deliberately skipped in v1 rather than
+  guessed at).
+
+### Added (mold generation)
+
+- `POST /models/{model_id}/mold`, `POST /mold`,
+  `GET /models/{model_id}/mold.zip` - generates a two-part silicone pour
+  box and a matching two-part rigid clamp shell for a model, via headless
+  Blender booleans (no LLM call). The pour box is for casting a model in
+  RTV silicone; the clamp shell holds the resulting flexible silicone mold
+  rigid via a bolted flange while pouring plaster of paris or cement into
+  it. `src/threedprompt/mold.py` / `src/threedprompt/blender_scripts/make_mold.py`.
+- `docs/adr/0005-two-piece-silicone-mold-and-clamp-shell.md` records the
+  design (why each half is built as its own open tray rather than
+  bisecting a sealed box, keys vs. bolted flange, shared cavity size, and
+  a subtle boolean-geometry gotcha found and fixed during development).
+
+### Added (thumbnail rendering)
+
+- `POST /thumbnail` - renders a square PNG thumbnail of an uploaded mesh
+  or STEP file via headless Blender (`thumbnail.py`,
+  `blender_scripts/render_thumbnail.py`): auto-framed orthographic
+  camera, Workbench-engine flat studio shading (no material/light setup
+  needed, fast enough to run per-file on demand). STEP/STP input is
+  first converted to a mesh via the FreeCAD backend's `step_to_mesh()`,
+  since Blender has no STEP importer. `.3mf` and `.amf` are deliberately
+  unsupported here - `.3mf` should use its own embedded slicer-preview
+  PNG instead (cheaper, more accurate) and `.amf` has no importer
+  anywhere in this pipeline. Built for the farm-manager sibling repo's
+  library scanner, which has no CAD tooling of its own - see
+  `docs/industry-tool-review-and-recommendations.md` #7 in that repo.
+- `THUMBNAIL_MAX_SIZE_PX` (default 2048) caps the requested render
+  resolution.
+
+### Added (FreeCAD backend: wall-thickness, STEP, solid healing)
+
+- FreeCAD (`freecad-python3` apt package, headless via `freecadcmd`) added
+  as a third CAD backend alongside OpenSCAD/Blender - Blender remains the
+  default/fallback for organic and mesh-only models; FreeCAD is tried
+  first only where it has a real advantage (solid B-rep operations).
+- `thickness.mesh_shell()` now tries FreeCAD's Part Thickness first for
+  `.stl` input, falling back to Blender's Solidify automatically if
+  FreeCAD is unavailable or the input isn't solid enough - no API change,
+  existing `/thicken` endpoints are unaffected.
+- `POST /step/upload`, `POST /models/{model_id}/export-step` - convert a
+  STEP solid to/from this service's mesh pipeline (a best-effort B-rep
+  wrap of the mesh, not true reverse-engineered parametric CAD).
+- `POST /models/{model_id}/repair-solid` - heals malformed B-rep topology
+  via OCCT's ShapeFix, a different class of repair than `/repair`'s
+  Blender-based open-boundary hole filling.
+- `GET /health` now reports `freecad_available` (doesn't affect
+  `status`/degraded - FreeCAD absence only disables its own endpoints).
+- `docs/adr/0012-freecad-third-cad-backend.md` records the decision and
+  the real semantic limitations found during development (Part Thickness
+  needs an opening face, unlike Blender's Solidify; `Part.export()` on a
+  bare shape silently omits all solid geometry - use `shape.exportStep()`;
+  STEP import only works via `Part.read()`, not `Part.insert`/`Import.*`).
+
+### Added (watertight analysis/repair)
+
+- `POST /watertight/upload`, `POST /models/{model_id}/analyze`,
+  `POST /models/{model_id}/repair`, `GET /models/{model_id}/viewer.glb` -
+  finds boundary-edge holes and inverted-normal ("wrinkle") defects on a
+  mesh via headless Blender, classifies each hole as a likely intentional
+  opening (a cup's mouth, an open box top, an open base underside) vs. a
+  likely unintentional defect via a pure-Python geometric heuristic
+  (`src/threedprompt/hole_classifier.py`), and lets the caller close a
+  chosen subset and re-check watertightness.
+- Browser 3D viewer at `/watertight.html` (three.js, vendored locally -
+  see `src/threedprompt/static/vendor/three/`) - upload a model, see every
+  flagged hole as a color-coded clickable marker on the actual mesh, pick
+  which to close, download the repaired file.
+- `docs/adr/0004-watertight-hole-detection-and-repair.md` records the
+  design (heuristic vs. ML classification, why hole ids are positional,
+  the Blender/glTF axis-conversion and OrbitControls-singularity bugs
+  found and fixed during development).
+
+### Changed
+
+- Default `MAX_UPLOAD_BYTES` raised from 50MB to 300MB - dense/scanned
+  STL meshes routinely exceeded the old default. Still configurable via
+  `.env` for files larger than that.
+- `POST /thicken` (arbitrary file upload) now returns the thickened STL
+  file directly instead of JSON, so uploading and getting the modified
+  file back is one round trip - usable directly from Swagger UI's
+  "Execute" -> "Download file". The new model_id and method are now
+  carried as `X-Model-Id` / `X-Thicken-Method` response headers instead of
+  JSON fields. `POST /models/{model_id}/thicken` is unchanged (still JSON).
+
+### Added
+
+- Minimal browser UI served at `/` (`src/threedprompt/static/index.html`) -
+  generate a model from a prompt, or pick a local STL/OBJ file, increase
+  its wall thickness, and download the result, all from a real file picker
+  without needing curl or the Swagger docs.
+- Initial service: `POST /generate` classifies a prompt (hybrid
+  heuristic/LLM router) and generates a model via OpenSCAD (simple/
+  parametric parts) or headless Blender (complex/organic shapes).
+- `POST /models/{model_id}/thicken` and `POST /thicken` to increase wall
+  thickness, preferring OpenSCAD-source regeneration and falling back to a
+  Blender Solidify mesh shell.
+- `GET /health` dependency status check; `GET /models/{model_id}/download`.
+- LLM backend abstraction supporting local Ollama (default, no-cost) and the
+  Claude API (opt-in, paid).
+- Docker/Compose setup bundling OpenSCAD, Blender, and a local Ollama
+  service.
+- Test suite covering the classifier, both generation backends, both
+  thickening strategies, storage, and the HTTP API (all CAD/LLM calls
+  mocked).

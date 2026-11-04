@@ -1,0 +1,956 @@
+# 3D Printing Model Prompt
+
+Turns a natural-language description of a part into a 3D-printable STL file,
+can increase the wall thickness of an existing model, can check a model for
+watertightness - finding surface gaps a slicer would choke on and telling
+deliberate openings (a cup's mouth, an open box top) apart from unintentional
+defects (a couple of misaligned vertices leaving a hole) - and can generate a
+two-part silicone pour box plus a matching clamp shell for casting a model in
+RTV silicone and then plaster of paris or cement.
+Simple, mechanical parts (brackets, mounts, spacers, enclosures) are built
+with **[OpenSCAD](https://openscad.org/)**; complex, organic, or
+characterful shapes (creatures, figurines, freeform sculptures) are built
+with **[Blender](https://www.blender.org/)** running headless, which also
+powers watertight analysis/repair and remains the default/fallback for
+wall-thickness shelling. **[FreeCAD](https://www.freecad.org/)** running
+headless is a third backend, tried first for `.stl` wall-thickness
+shelling (a real solid B-rep result via Part Thickness, not just a
+thicker mesh) and for two capabilities Blender can't do at all: STEP
+import/export and solid healing (OCCT's ShapeFix) - see
+[STEP conversion & solid healing](#step-conversion--solid-healing) below
+and `docs/adr/0012-freecad-third-cad-backend.md`. An HTTP API in front
+decides which backend to use per request.
+
+**Browser UI**: once the service is running, open `http://localhost:8000/`
+in a browser for a simple page to generate a model from a prompt, pick a
+local file to increase its wall thickness, or open the
+[watertight checker](#watertight-check--repair) - a 3D viewer for spotting
+and closing holes - no curl or API client needed. The full HTTP API (below)
+is also available for scripting/automation, with interactive docs at
+`/docs`.
+
+## How routing works
+
+1. A cheap, deterministic keyword heuristic looks at the prompt first
+   (`src/threedprompt/classifier.py`) - words like "bracket" or "mount" route
+   to OpenSCAD, words like "creature" or "dragon" route to Blender. This
+   costs nothing and handles most requests.
+2. If the heuristic isn't confident (prompt matches both vocabularies, or
+   neither), the configured LLM is asked to classify it instead, so unusual
+   prompts still get routed sensibly.
+3. **OpenSCAD path**: a handful of built-in parametric templates (bracket,
+   box/enclosure, plate, spacer/standoff) cover common parts with no LLM call
+   at all. Anything else is authored as OpenSCAD source by the LLM and
+   compiled to STL.
+4. **Blender path**: always LLM-authored - the LLM writes a small `bpy`
+   Python script that builds the shape from primitives and modifiers, which
+   headless Blender then runs and exports to STL.
+5. **CadQuery path** (`src/threedprompt/cadquery_gen/`): a simple prompt
+   that no OpenSCAD template covers goes to CadQuery when
+   `SIMPLE_LLM_BACKEND=cadquery` (the default) and the sandbox can run on
+   this host; otherwise it falls back to LLM-authored OpenSCAD (logged).
+   The LLM writes CadQuery Python, which runs in a sandboxed subprocess,
+   then the STL must pass the watertight check. The sandbox is
+   `cadquery_gen/runner.py`: Linux Landlock allows file writes only in the
+   model's output folder and no `exec`; a seccomp filter makes `socket()`
+   fail at the kernel (on every kernel, for Python and native code alike);
+   a Python audit hook also blocks sockets,
+   subprocesses and ctypes; rlimits cap CPU (`CAD_SUBPROCESS_TIMEOUT_SECONDS`),
+   memory (`CADQUERY_MEMORY_LIMIT_MB`, default 4096) and file size; and the
+   child gets no environment variables (no API keys). On kernels 6.7+
+   Landlock also denies TCP connect/bind. It **refuses to run without
+   Landlock** (Linux 5.13+), so on Windows/macOS use Docker. Its tests run
+   in the image (Linux/Mac shell; on Windows run it from WSL):
+
+   ```bash
+   cd /path/to/3d-printing-model-prompt && docker build -t threedprompt . && docker run --rm -v "$PWD/tests:/app/tests:ro" -v "$PWD/requirements-dev.txt:/app/requirements-dev.txt:ro" threedprompt sh -c "pip install -q --user -r requirements-dev.txt && python -m pytest -q -rs tests/test_cadquery_gen.py"
+   ```
+
+**Known limitation:** there's no deterministic fallback for organic shapes -
+"a dwarf sitting under a mushroom" is genuinely hard to model well from a
+short text prompt via generated `bpy` code, and result quality tracks the
+LLM's capability. A local Ollama model will produce cruder geometry than a
+larger hosted model; this is a real case where a paid model's quality helps
+(see [AI/LLM backend](#aillm-backend) below) - that's a deliberate tradeoff to
+make, not a bug to chase.
+
+## Wall thickness
+
+`POST /models/{model_id}/thicken` increases the wall thickness of a model
+this service generated, in millimeters:
+
+- If the model was built via OpenSCAD and its source declares a
+  `wall_thickness` variable, that variable is bumped and the part is
+  **re-rendered from source** - the cleanest result, still fully parametric,
+  no LLM call.
+- Otherwise, for `.stl` input, headless **FreeCAD's Part Thickness**
+  operation is tried first, giving a real solid B-rep result rather than
+  a thicker mesh - falling back automatically to Blender's **Solidify
+  modifier** if FreeCAD is unavailable or the input isn't solid/manifold
+  enough for Part Thickness. Every other mesh format goes straight to
+  Blender. See `docs/adr/0012-freecad-third-cad-backend.md`.
+
+`POST /thicken` does the same mesh-shelling for an arbitrary uploaded
+STL, OBJ, or Rhino `.3dm` file that this service didn't generate - useful for any file you
+already have. Unlike the other endpoints, `POST /thicken` returns the
+thickened **STL file itself** directly (not JSON) - it's meant to be a
+single round trip: load a file, modify it, get the modified file back. The
+new model's id and the method used are still available afterwards as
+response headers (`X-Model-Id`, `X-Thicken-Method`), e.g. if you want to
+re-download the same result later via `GET /models/{model_id}/download`.
+
+Either way, thickening produces a *new* model rather than overwriting the
+original.
+
+Optional `quad_target_faces` (default `0` = off, max 1,000,000; JSON field
+or form field) retopologizes the shelled mesh into roughly that many
+quad-dominant faces via Blender's QuadriFlow - a topology/cosmetic pass,
+ignored on the regenerate-from-source path. Pick a target above the mesh's
+natural face count; too low a target can leave it non-watertight even
+after the repair pass that runs afterwards.
+
+**Rhino `.3dm` input:** `.3dm` files are read inside headless Blender by a
+vendored copy of the MIT-licensed
+[import_3dm](https://github.com/jesterKing/import_3dm) converter
+(`src/threedprompt/blender_scripts/vendor/rhino3dm_reader/`, see its
+`NOTICE.md`), which needs the `rhino3dm` Python package installed into
+the Python that Blender runs (the Docker image does this). Rhino units are
+converted to millimeters. The browser UI's file pickers don't offer `.3dm`
+yet - use the API (`/thicken`, `/mold`, `/watertight/upload`).
+
+## Mold generation
+
+`POST /models/{model_id}/mold` builds mold tooling around a model this
+service generated (or thickened/repaired), split at the model's own
+vertical midpoint. Four modes, chosen via `"mode"` (default
+`"silicone_block"`):
+
+**`silicone_block`** - a two-part silicone **pour box** (`pour_box_bottom.stl`
+/ `pour_box_top.stl`) and a matching two-part rigid **clamp shell**
+(`clamp_shell_bottom.stl` / `clamp_shell_top.stl`), 4 parts total:
+
+1. Print the pour box halves. Assemble them around the printed model (the
+   hemispherical registration keys near the parting line align the halves)
+   and pour RTV silicone in through the top half's sprue hole, using the
+   vent hole to let trapped air escape. Once cured and demolded, you have a
+   two-piece flexible silicone mold shaped like the model.
+2. Print the clamp shell halves. Reassemble the silicone mold's two pieces
+   and clamp the rigid shell around them using bolts (or zip ties) through
+   the flange holes - this is what keeps the flexible silicone from
+   bulging or leaking under the pressure of the next pour.
+3. Pour plaster of paris or cement into the clamp shell's own sprue hole,
+   which lines up with the silicone mold's cavity underneath it. Once
+   cured, unbolt the clamp shell and peel the silicone mold away.
+
+**`direct_cast`** - a single rigid two-part mold (`direct_mold_bottom.stl`
+/ `direct_mold_top.stl`, 2 parts) whose cavity is shaped like the model
+itself - no silicone step. Bolt the two printed halves together through
+the flange holes and pour resin, urethane, or foam straight into the
+sprue hole. Only suitable for a model with no undercuts along the Z axis
+(a rigid mold can't flex to release one the way silicone can), and v1
+ships with no draft angle or release tolerance - see
+`docs/adr/0006-direct-cast-mold-mode.md` for why those were deferred
+rather than guessed at.
+
+**`form_fitting`** - a thin, contour-following silicone **skin-pour tool**
+(`skin_pour_bottom.stl` / `skin_pour_top.stl`) and a matching rigid
+**support jacket** (`support_jacket_bottom.stl` / `support_jacket_top.stl`),
+4 parts total - for organic/detailed models a rigid `direct_cast` mold
+couldn't release along any single axis:
+
+1. Print the skin-pour tool halves and assemble them around the printed
+   model (registration keys align them, same as `silicone_block`'s pour
+   box). Pour RTV silicone through the sprue hole - since the tool's
+   cavity is the model's own surface grown outward by `shell_thickness_mm`,
+   this casts a thin silicone shell that exactly hugs the model's contours.
+2. Print the support jacket halves and bolt them around the finished
+   flexible shell through the flange holes - same role as
+   `silicone_block`'s clamp shell, holding the thin shell rigid.
+3. Pour plaster of paris or cement into the jacket's sprue hole.
+
+The offset is a per-vertex normal push, not a true Minkowski offset: flat
+or smoothly-curved regions of the model grow by exactly
+`shell_thickness_mm`, but sharp corners/edges come out thinner than
+requested - see `docs/adr/0008-form-fitting-thin-shell-mold.md`. Fine for
+the organic/rounded models this mode targets; not recommended for boxy
+models with sharp corners (use `direct_cast` or `silicone_block` there
+instead).
+
+**`hollow_cast`** - the same rigid outer mold as `direct_cast`
+(`hollow_cast_bottom.stl` / `hollow_cast_top.stl`) plus a separate solid
+**core** (`hollow_cast_core.stl`), 3 parts total - for casting a hollow
+vessel (a vase, a cup) as a genuine shell instead of a solid block:
+
+1. Print the outer mold halves and the core.
+2. Place the core inside the bottom half's cavity, then close the top
+   half - the core is the model's own surface shrunk inward by
+   `cast_wall_thickness_mm`, so a gap of exactly that thickness surrounds
+   it on every side.
+3. Bolt the halves together and pour resin, urethane, or plaster into the
+   sprue hole - it fills only that gap, forming a hollow shell rather
+   than a solid cast.
+
+Shares `direct_cast`'s no-draft/no-release-tolerance limitations, plus
+`form_fitting`'s offset-technique limitations (corner-rounding, concave
+self-intersection risk) applied inward instead of outward - see
+`docs/adr/0009-hollow-vessel-inner-core-mode.md`.
+
+`POST /mold` does the same for an arbitrary uploaded mesh, returning the
+resulting STL parts as one zip directly (one round trip, like
+`POST /thicken`). All dimensions are in millimeters and every parameter has
+a sensible default (see `MoldRequest` in `/docs`); the ones worth knowing
+about:
+
+- `clearance_mm` (default 8, `silicone_block` only) - gap between the
+  model surface and the pour box's cavity wall, i.e. how thick the cast
+  silicone will be.
+- `pour_box_wall_mm` / `clamp_wall_mm` (default 4 / 6, `silicone_block`
+  only) - rigid wall thickness of each part; the clamp shell is thicker by
+  default since it resists real hydraulic pressure, not just holding a
+  shape during a pour.
+- `direct_mold_wall_mm` (default 6, `direct_cast` and `hollow_cast`) -
+  rigid wall thickness of the outer mold.
+- `shell_thickness_mm` (default 3, `form_fitting` only) - how far the
+  model's surface is grown outward to form the cavity shape; this becomes
+  the finished silicone shell's own thickness.
+- `skin_pour_wall_mm` / `support_jacket_wall_mm` (default 3 / 5,
+  `form_fitting` only) - rigid wall thickness of each part, same
+  thinner-tool/thicker-jacket relationship as `silicone_block`.
+- `cast_wall_thickness_mm` (default 4, `hollow_cast` only) - how far the
+  core is shrunk inward from the model's own surface; this becomes the
+  finished cast's own wall thickness.
+- `clamp_flange_width_mm` / `bolt_hole_diameter_mm` (default 12 / 4.5,
+  `silicone_block`'s clamp shell, `direct_cast`, `form_fitting`'s support
+  jacket, and `hollow_cast`'s outer mold) - the bolted flange; 4.5mm is M4
+  clearance.
+- `sprue_diameter_mm` / `vent_diameter_mm` (default 10 / 4, all modes) -
+  the pour hole and its air-vent hole through each top half's ceiling.
+  The vent is placed over a real detected trapped-air pocket (the
+  cavity's own highest local surface peak) when the model has one,
+  falling back to a fixed offset from the cavity center for boxy models
+  with no such peak - see
+  `docs/adr/0011-geometry-aware-vent-placement.md`. Each hole diameter
+  must be smaller than the cavity's own footprint - a hole comparable to
+  (or larger than) the cavity itself would punch away the entire ceiling
+  instead of leaving a working pour hole, and is rejected with a clear
+  error rather than silently producing a broken mold; scale both down
+  for small models.
+- `parting_axis` (default `"z"`, all modes) - which model axis the two
+  halves split along (`"x"`, `"y"`, or `"z"`). A non-`z` axis is
+  implemented as a rotation baked into the model before building, so the
+  exported parts come out in that rotated frame, not the upload's
+  original orientation - see
+  `docs/adr/0010-configurable-parting-axis-and-volume-reporting.md`.
+- `parting_offset_mm` (default 0, all modes) - shifts the parting plane
+  this far from the model's own bounding-box midpoint along
+  `parting_axis` (positive moves it toward the max end); rejected if it
+  would push the split outside the model's own range.
+- `material_density_g_per_cm3` (optional, all modes) - when given,
+  `estimated_cast_mass_g` (JSON) / `X-Estimated-Cast-Mass-G` (upload
+  header) reports `cavity_volume_cm3 * material_density_g_per_cm3`.
+
+Before generating any mode, the input mesh is automatically checked for
+watertightness and repaired if needed: holes the existing watertight-check
+heuristic confidently calls likely defects (not likely-intentional
+openings) are closed automatically; anything left open fails the request
+with a clear error instead of handing Blender's boolean solver broken
+geometry (a rigid boolean cavity cut needs a genuinely closed mesh, and a
+broken one otherwise fails opaquely deep inside the Blender subprocess).
+Which hole ids (if any) were auto-repaired comes back as
+`repaired_hole_ids` in the JSON response for `POST /models/{model_id}/mold`,
+or the `X-Repaired-Hole-Ids` header for `POST /mold` - inspect them via
+`POST /models/{model_id}/analyze` if you want to know what was found.
+
+Every generation also reports the actual cast/pour material volume -
+`cavity_volume_cm3` in the JSON response, or `X-Cavity-Volume-Cm3` for
+`POST /mold` - and, if you pass `material_density_g_per_cm3`, an estimated
+mass (`estimated_cast_mass_g` / `X-Estimated-Cast-Mass-G`). What "cavity"
+means differs by mode - `silicone_block`'s pour-box cavity, `direct_cast`/
+`hollow_cast`'s own model volume (minus the core's, for `hollow_cast`),
+`form_fitting`'s thin shell gap - see
+`docs/adr/0010-configurable-parting-axis-and-volume-reporting.md`.
+
+`direct_cast` also runs an automatic, non-blocking draft-angle/undercut
+check after generating (a rigid mold can't flex around an undercut the
+way silicone can): `draft_check` in the JSON response, or the
+`X-Draft-Releasable` / `X-Draft-Problem-Island-Count` headers for
+`POST /mold`, tell you if anything was flagged without failing the
+request. For full per-face detail (or to check a `silicone_block` model,
+or try a different pull axis/threshold before committing to a full
+generation), call `POST /models/{model_id}/mold/draft-check` directly:
+
+```bash
+curl -X POST http://localhost:8000/models/<model_id>/mold/draft-check \
+  -H "Content-Type: application/json" \
+  -d '{"pull_axis": "z", "min_draft_angle_deg": 2.0}'
+```
+
+It reports `releasable` and a `problem_islands[]` list (each a connected
+group of faces, classified `"undercut"` - won't release at all - or
+`"insufficient_draft"` - releases, but with less clearance than
+requested), without modifying or generating anything. See
+`docs/adr/0007-draft-undercut-analysis.md` for how draft angle is
+measured and why each half's own pull direction is used rather than one
+global direction.
+
+See `docs/adr/0005-two-piece-silicone-mold-and-clamp-shell.md` for why the
+pour box uses registration keys while the clamp shell uses a bolted flange
+instead, and how the geometry was verified against a real Blender install.
+See `docs/adr/0006-direct-cast-mold-mode.md` for direct_cast's own design
+(model-mesh-as-cavity-tool, and why draft/tolerance/keys were skipped in
+v1), `docs/adr/0007-draft-undercut-analysis.md` for the draft-angle
+heuristic, `docs/adr/0008-form-fitting-thin-shell-mold.md` for
+form_fitting's offset-along-normals technique and its corner-rounding
+limitation, `docs/adr/0009-hollow-vessel-inner-core-mode.md` for how
+hollow_cast reuses that same offset technique inward with no new boolean
+step, `docs/adr/0010-configurable-parting-axis-and-volume-reporting.md`
+for the parting-axis rotation trick, `parting_offset_mm`'s validation, the
+per-mode casting-volume formulas, and a real `_add_pour_holes()` bug found
+and fixed while testing it (an oversized sprue/vent hole could silently
+punch away a mold's entire ceiling - now a rejected, clearly-named error),
+and `docs/adr/0011-geometry-aware-vent-placement.md` for how a trapped-air
+pocket is detected (and why a flat-topped box's corners don't falsely
+count as one). See `docs/mold-production-research-and-plan.md` for the
+research behind this feature (competitor tools, manual-technique guides)
+and what's deliberately out of scope (custom branding, a batch/grid tool,
+and any browser-UI work).
+
+## Watertight check & repair
+
+Finds boundary-edge holes (surface gaps) and inverted-normal ("wrinkle")
+defects in a model - either one this service generated, or an arbitrary
+upload - and classifies each hole as a likely **intentional opening** (a
+cup's mouth, an open box top, an open base underside) or a likely
+**unintentional defect** (a couple of misaligned/duplicate vertices
+leaving a gap), with a confidence and plain-language reason for each.
+
+Open `http://localhost:8000/watertight.html` for the 3D viewer: upload a
+model, see every flagged hole as a color-coded clickable marker on the
+actual mesh (red = likely defect, green = likely intentional, amber =
+ambiguous), click a marker or its row in the side panel to pick which to
+close, then repair and download. The underlying API:
+
+1. `POST /watertight/upload` - upload a mesh (any of
+   `.stl .obj .ply .glb .gltf .fbx .3dm`), get back a `model_id`.
+2. `POST /models/{model_id}/analyze` - runs the check, returns
+   `is_watertight`, every `holes[]` entry's classification/confidence/
+   reason, any `flipped_normal_islands[]`, `self_intersection_count`
+   (face pairs that cut through each other), `mesh_volume_cm3` (enclosed
+   volume, 1 unit = 1 mm; `null` when the mesh isn't watertight), and a
+   `viewer_glb_url` for the 3D preview.
+3. `POST /models/{model_id}/repair` with `{"hole_ids": [...]}` - closes
+   just those holes (leaving the rest open), re-checks watertightness,
+   and returns a fresh `download_url`. **Hole ids are positional** - they
+   renumber whenever the file changes, including after closing some of
+   them, so always use ids from the most recent `/analyze` response.
+   Or send `{"auto_repair": true}` instead of `hole_ids`: the model is
+   re-analyzed and only holes classified *likely defect* are closed (plus a
+   normals recalculation that fixes flipped regions); intentional and
+   ambiguous openings stay open and come back in `skipped_hole_ids`. If
+   there's nothing to fix, the file is left untouched and `changed` is
+   `false`. 3dPrinterWorkshopManager uses this for its intake check.
+
+A model generated via `POST /generate`, or thickened via
+`/models/{model_id}/thicken`, can be checked the same way - just call
+`/models/{model_id}/analyze` directly on its existing `model_id`, no
+separate upload needed.
+
+See `docs/adr/0004-watertight-hole-detection-and-repair.md` for how the
+classification heuristic works and why it's a heuristic rather than an
+LLM/ML call.
+
+## Spiral wand & spinning figurines
+
+Makes a gravity "spinner" toy: a long twisted wand, plus **riders** -
+figurines with a matching twisted bore through them. Thread a rider onto
+the wand, hold it cap-up, let go, and the rider screws itself down the
+spiral, spinning as it falls, until it lands on the handle's stop flange.
+
+Open `http://localhost:8000/spiral-wand.html` for the GUI:
+
+- **Wand**: total length (or the spiral length directly), handle length
+  and diameter, the **handle distance** (the plain "rest gap" between the
+  handle stop and the spiral, where a rider lands and spins freely - set
+  it at least as tall as your rider), and the **end cap**: dome, disc,
+  cone, none, or your own model file scaled onto the tip. The cap is a
+  separate part on a one-way D-peg, because it has to come off to load
+  riders. A wand taller than *Max print height* is split inside the
+  spiral into D-pegged sections, with the twist continuous across each
+  joint.
+- **Rider**: upload a figurine (STL/OBJ/PLY/GLB), **generate one from a
+  prompt** (runs the normal `/generate` pipeline first), or reuse any
+  `model_id`. Set its height and which axis of the file points up; a
+  full-height sleeve around the bore keeps thin parts from breaking open,
+  and an optional round base helps figures that don't stand on their own.
+- **Viewer**: shows the assembled wand and rider in 3D. Drag the slider,
+  or press Play, to watch the rider spin down the spiral. Every part
+  downloads as STL, or all of them as one zip.
+
+The rod settings (diameter, lobes, lobe depth, pitch, spin direction,
+clearance) are shared: a rider only fits a wand built with the same
+values. The GUI warns if they differ. The default `clearance_mm` (0.45)
+and `pitch_mm` (120) are starting guesses, not print-tested values - print
+a short wand and one rider first and adjust.
+
+This needs no LLM, OpenSCAD, Blender or FreeCAD: `spiral_wand.py` builds
+everything in-process with manifold3d and trimesh (see
+`docs/adr/0014-spiral-wand-manifold3d.md`). The API:
+
+1. `POST /spiral-wand` with wand + rod settings (all optional, see
+   `/docs`) -> JSON with `model_id`, `parts[]` (each with `url`,
+   `z_offset_mm` in the assembled wand and `size_mm`), `notes[]`, and a
+   zip `download_url`. Set `cap_model_id` to use an uploaded or generated
+   model as the end cap.
+2. `POST /models/{model_id}/spiral-wand/rider` with rod + rider settings
+   -> the same JSON shape, with one `rider.stl` part. `model_id` is any
+   generated model or a `/watertight/upload` upload.
+3. `GET /models/{model_id}/parts/{filename}` downloads one part;
+   `GET /models/{model_id}/spiral-wand.zip` downloads them all.
+
+Meshes that aren't closed solids are lightly repaired (merged vertices,
+small holes filled, overlapping shells unioned); anything worse is
+rejected with a 422 that points you to the watertight checker.
+
+## Split to fit the bed
+
+Open `http://localhost:8000/split.html`, pick a model (upload or
+`model_id`) and a printer preset or bed size, and press **Split**. A model
+too big for the bed is cut on the smallest grid of equal cells that each
+fit (in any upright or lying-down orientation), and every cut face gets
+connectors so the pieces line up:
+
+- **Dowel pins** (default): matching holes in both pieces, plus
+  `dowel_pin.stl` to print (the response says how many).
+- **One-way D-peg**: a D-shaped peg on one piece and a socket in the other,
+  so the joint only goes together one way. No loose pins.
+- **None**: plain cuts to glue flat.
+
+Connectors sit inside each cut's cross-section with a wall around them;
+a face too thin or small for one is listed in the notes (glue it flat).
+Pieces keep the model's coordinates, so they reassemble with no transform;
+the page shows them assembled or pulled apart, with each piece's size and
+how to lay it on the bed. API: `POST /models/{model_id}/split` (see
+`/docs`), then `GET /models/{model_id}/parts/{filename}` or
+`GET /models/{model_id}/split.zip`. Built in-process with manifold3d like
+the spiral wand; .
+
+## Overhang check
+
+The split, spiral wand and watertight pages have an **overhangs** toggle
+that paints in red every face pointing down more steeply than 45 deg from
+vertical (the split page lets you change the angle): the parts that need
+support if printed as shown. Faces lying on the bed are ignored, and each
+split piece or wand part is checked on its own bed since they print
+separately. `GET /models/{model_id}/overhangs?angle_deg=45` returns the same
+measure for any model: `overhang_area_mm2`, `total_area_mm2`,
+`overhang_fraction` and `overhang_face_count`, printed Z up as stored.
+.
+
+## Tool insert from a photo
+
+Open `http://localhost:8000/tool-insert.html`. Lay your tools on a sheet of
+plain white paper, put a solid dark square of known size (10-30 mm; print
+one or cut it from black card) on the sheet beside them, and take a photo
+from roughly above with the whole sheet in frame. Pick the paper size and
+square size, then **Trace outlines**: the page finds the sheet, corrects
+the perspective, uses the square for scale and draws each tool's outline
+over the photo. Fix anything it got wrong: drag points, double-click an
+edge to add one, right-click to remove one, switch off shapes you don't
+want, and add round finger notches. No square? Use **Set scale** and click
+two points a known distance apart (the paper's long edge works).
+
+**Build insert** makes a tray with a pocket per tool: the outline grown by
+the clearance (snug 0.5 / normal 1 / loose 2 mm), at the depth you choose,
+with an optional stepped chamfer on the top edge. *Fitted box* is just big
+enough for the pockets plus the wall; *Gridfinity* rounds up to 42 mm grid
+units and 7 mm height units and adds the standard stepped feet (no stacking
+lip, so the insert sits flush; no magnet holes yet).
+
+API: `POST /tool-insert/trace` (multipart: `file`, `square_mm`, `paper`,
+optional `mm_per_px`) returns outlines in pixels and mm plus a JPEG preview
+of the corrected sheet; nothing is stored. `POST /tool-insert` (JSON:
+`tools[{outline_mm, notches}]` and tray settings) builds
+`tool_insert.stl` under a new `model_id`. Image processing uses OpenCV;
+geometry is manifold3d. .
+
+## Print templates
+
+Open `http://localhost:8000/templates.html`. Six parametric parts, built by
+rules (no AI), each shown in the 3D viewer with its STLs and a report:
+
+- **Gridfinity bin:** width/depth in 42 mm units, height in 7 mm units,
+  a grid of compartments, stacking lip, 45 deg label tabs (print without
+  support) and 6.5 x 2.4 mm magnet holes in each foot. Sizes follow the
+  published Gridfinity spec (`gridfinity.py`); the lip is an approximation.
+- **Minis bin:** a Gridfinity bin for miniatures. The floor is a grid of
+  round sockets, one per base (25, 28, 32, 40, 50 or 60 mm, plus clearance),
+  so figures can't slide into each other, with an optional magnet hole under
+  each socket and the bin open above them for the figures. The report gives
+  the socket count and the headroom.
+- **Terrain tile:** a tabletop tile from a seeded height field: rolling
+  hills, rocky ridges, craters or mesas. Terraces step the surface into flat
+  levels for miniatures to stand on, and the report says how much of the
+  tile is under 15 deg. The edges always ease down to the base height, so
+  tiles from any seed join, and optional magnet holes in the bottom corners
+  hold them together. Same seed + settings = same tile (`terrain.py`).
+- **Gears:** involute spur or helical gears from module, tooth count,
+  pressure angle and backlash, with round, D or hex bores; optionally a
+  mating gear (placed in mesh, opposite helix) and a rack. The report gives
+  pitch/tip/root diameters, centre distance and contact ratio.
+- **Lithophane:** a photo becomes a height map (darker = thicker) on a
+  flat panel, a curved panel or a cylinder lamp shade, with a solid frame.
+- **QR tag:** text, a URL or Wi-Fi login as a raised QR code on a plate,
+  with key-ring hole and NFC sticker pocket. The plate and code are also
+  separate STLs for two-colour printing. A Wi-Fi password ends up in the
+  printed code (that's what it's for) but is never logged or saved in the
+  model's spec.
+
+API: `POST /templates/gridfinity-bin`, `/templates/minis-bin`, `/templates/terrain`,
+`/templates/gear`, `/templates/qr-tag`
+(JSON) and `/templates/lithophane` (multipart: `file` + settings). Each
+returns a `model_id`, part URLs, notes and a `report`. .
+
+## Multi-colour 3MF
+
+Any build with several parts (a QR tag's plate and code, gears, split
+pieces, a wand and its rider) can be exported as **one 3MF with a filament
+per part**, for the Bambu AMS or the Elegoo CANVAS. On the templates page,
+pick a colour and a filament slot for each part under *Multi-colour 3MF*,
+choose the slicer and download. A QR tag defaults to a white plate (slot 1)
+and black code (slot 2).
+
+- **Bambu Studio / OrcaSlicer / Elegoo Slicer / Anycubic Slicer Next:**
+  slicer "orca". Open the file (don't import it into an existing project)
+  and each part keeps its slot.
+- **PrusaSlicer:** slicer "prusa". It reads multi-part objects
+  differently, so the same file won't serve both (see
+  `docs/adr/0015-multicolour-3mf-two-layouts.md`).
+- Untick *Keep parts together* to get each part as its own object.
+
+API: `POST /models/{model_id}/export-3mf` with
+`{"parts": [{"filename", "color", "extruder"}], "assembled", "slicer"}`
+(omit `parts` for every part, one slot each), then
+`GET /models/{model_id}/multicolour.3mf`. .
+
+## STEP conversion & solid healing
+
+Two FreeCAD-backed capabilities Blender can't provide at all:
+
+1. **STEP import/export** - `POST /step/upload` (multipart, `.step`/`.stp`)
+   converts an uploaded STEP solid into this service's mesh pipeline
+   (returns a `model_id` usable with every other endpoint);
+   `POST /models/{model_id}/export-step` converts a model's mesh back into
+   a STEP solid and returns the file directly. This is a best-effort B-rep
+   wrap of mesh triangles, not true reverse-engineered parametric CAD - a
+   flat face becomes one real STEP planar face, but there's no
+   curve/fillet recovery.
+2. **Solid healing** - `POST /models/{model_id}/repair-solid` runs OCCT's
+   ShapeFix to repair malformed B-rep topology (small gaps, invalid
+   edges/faces), overwriting the model's STL in place. This is a
+   **different class of repair** than `/repair` above: watertight repair
+   closes genuine missing patches in a mesh (an open boundary loop);
+   solid healing fixes a shape that's already "closed-looking" but
+   geometrically malformed (e.g. after a rough mesh-to-solid conversion or
+   a messy STEP import). Use `/repair` for a mesh with an actual hole,
+   `/repair-solid` for a solid that fails validity checks despite looking
+   closed.
+
+Both require FreeCAD (`freecad_available` in `GET /health`) - unlike
+Blender, FreeCAD isn't required for the service overall, so these two
+endpoints return `503` if it's unavailable while everything else keeps
+working. See `docs/adr/0012-freecad-third-cad-backend.md` for the real
+semantic limitations found integrating FreeCAD (STEP import only works
+via one specific API call; `Part.export()` on a bare shape silently omits
+all geometry; Part Thickness needs an "opening" face, unlike Solidify).
+
+## Thumbnails
+
+`POST /thumbnail` renders a square PNG thumbnail of an uploaded mesh or
+STEP file via headless Blender - an auto-framed orthographic camera and
+flat Workbench-engine shading, fast enough to run per file on demand
+rather than needing a pre-baked render pipeline. STEP/STP input is
+converted to a mesh via FreeCAD first (Blender has no STEP importer).
+`.3mf` isn't handled here on purpose - extract its embedded slicer-preview
+PNG instead, which is cheaper and more accurate than a fresh render of a
+re-triangulated mesh; `.amf` has no importer anywhere in this pipeline
+either. Returns the PNG directly, one round trip, the same shape as
+`POST /thicken`. Built primarily for a caller with no CAD tooling of its
+own - see the farm-manager sibling repo's Library feature.
+
+## AI tag suggestions
+
+`POST /tags/suggest` suggests short descriptive tags for a library file
+from its filename, designer name, and any known slicer metadata (filament
+colors), via the configured LLM backend (Ollama-first, see "AI/LLM
+backend" below) - text-only reasoning, not a vision model inspecting the
+actual geometry, so treat suggestions as a rough starting point for human
+review rather than authoritative. Never fails outright: if the LLM is
+unreachable or returns something unparseable, it falls back to
+filename-derived heuristic tags and reports `"method": "heuristic_fallback"`
+in the response so a caller can tell the two apart. Built for the same
+farm-manager sibling repo's Library feature as `/thumbnail` above.
+
+## Voice answers (speech-to-text)
+
+`POST /transcribe` (multipart `file`: a short `.webm`/`.ogg`/`.oga`/`.wav`/
+`.mp3`/`.m4a`/`.mp4` recording) returns `{"text": "..."}`. It runs **locally** with
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) on CPU - no
+cloud speech API. Built for the farm-manager sibling repo's AI Model
+Generator interview, so answers can be spoken instead of typed.
+
+- The Whisper model (`WHISPER_MODEL`, default `base.en`, ~140 MB) downloads
+  on the first request into `WHISPER_MODEL_DIR` (default
+  `<OUTPUT_DIR>/whisper-models`, i.e. inside the `threedprompt_output`
+  volume under Docker) and stays loaded. First answer: ~10 s plus the
+  download; later ones: 1-2 s.
+- `WHISPER_MODEL=small.en` is more accurate but slower (~460 MB); drop the
+  `.en` for other languages. `WHISPER_DEVICE`/`WHISPER_COMPUTE_TYPE`
+  default to `cpu`/`int8`.
+- Uploads over `MAX_AUDIO_UPLOAD_BYTES` (25 MB) get a 413; a missing
+  dependency or failed model download gets a 503 with the reason.
+
+## API
+
+| Method | Path                          | Description                                                          |
+|--------|-------------------------------|------------------------------------------------------------------------|
+| GET    | `/health`                     | Reports OpenSCAD/Blender/FreeCAD/LLM availability                       |
+| POST   | `/generate`                   | `{"prompt": "...", "wall_thickness_mm": 3.0, "backend": "openscad", "use_templates": false}` (backend optional: skips the classifier; use_templates false: no keyword template, no cache) -> JSON w/ model_id |
+| GET    | `/models/{model_id}/download` | Download the STL                                                        |
+| POST   | `/models/{model_id}/thicken`  | `{"amount_mm": 1.5}` -> JSON w/ new model_id (see above)                 |
+| POST   | `/thicken`                    | multipart upload (`file` .stl/.obj/.3dm, `amount_mm`, optional `quad_target_faces`) -> **the thickened STL file** |
+| POST   | `/models/{model_id}/mold`     | Mold params incl. `mode` (all optional) -> JSON w/ new model_id, `download_url` for the zip |
+| GET    | `/models/{model_id}/mold.zip` | Download the generated mold STL parts as one zip                        |
+| POST   | `/mold`                       | multipart upload (`file` .stl/.obj/.3dm, mold params incl. `mode`) -> **the STL parts as one zip** |
+| POST   | `/models/{model_id}/mold/draft-check` | `{"pull_axis": "z", "min_draft_angle_deg": 2.0}` -> JSON draft/undercut report, no files |
+| POST   | `/watertight/upload`          | multipart upload (`file`) -> JSON w/ model_id                           |
+| POST   | `/models/{model_id}/analyze`  | Watertight check -> JSON report (holes, classifications, viewer URL)    |
+| POST   | `/models/{model_id}/repair`   | `{"hole_ids": [0, 2]}` or `{"auto_repair": true}` -> closes holes, re-checks, new download |
+| GET    | `/models/{model_id}/viewer.glb` | Web-viewable GLB preview (produced by a prior analyze/repair call)   |
+| POST   | `/step/upload`                | multipart upload (`file`, `.step`/`.stp`) -> JSON w/ model_id (mesh)    |
+| POST   | `/models/{model_id}/export-step` | Converts the model's mesh to STEP -> **the STEP file**               |
+| POST   | `/models/{model_id}/repair-solid` | Heals B-rep topology via FreeCAD ShapeFix -> JSON, overwrites in place |
+| POST   | `/spiral-wand`                | Wand + rod settings (all optional) -> JSON w/ model_id, parts (URLs, assembly offsets), notes |
+| POST   | `/models/{model_id}/spiral-wand/rider` | Rod + rider settings -> JSON w/ new model_id and the rider part |
+| GET    | `/models/{model_id}/parts/{filename}` | Download one spiral wand, rider, split or tool insert STL part |
+| POST   | `/models/{model_id}/split`    | Bed size + connector settings -> JSON w/ new model_id, pieces (fit + print hint), zip URL |
+| GET    | `/models/{model_id}/overhangs` | `?angle_deg=45` -> JSON: area/fraction of the surface that needs support (Z up) |
+| GET    | `/models/{model_id}/split.zip` | Download every piece of a split (and the dowel pin) as one zip         |
+| POST   | `/tool-insert/trace`          | Photo of tools on paper (multipart) -> JSON: outlines in px and mm, corrected preview |
+| POST   | `/tool-insert`                | Tool outlines + tray settings -> JSON w/ new model_id and `tool_insert.stl` URL |
+| POST   | `/templates/gridfinity-bin`   | Grid/height units, compartments, lip, tabs, magnets -> JSON w/ model_id, part URLs, report |
+| POST   | `/templates/minis-bin`        | Grid/height units, base diameter, socket depth, magnets -> `minis_bin.stl` + socket report |
+| POST   | `/templates/terrain`          | Style, seed, size, height, terraces, edge fade, magnets -> `terrain_tile.stl` + report |
+| POST   | `/templates/gear`             | Module, teeth, pressure angle, backlash, bore (+ mate, rack) -> parts + mesh report |
+| POST   | `/templates/lithophane`       | Image (multipart) + shape/thickness/frame -> `lithophane.stl` |
+| POST   | `/templates/qr-tag`           | Text/URL or Wi-Fi -> raised QR tag + separate plate/code STLs |
+| POST   | `/models/{model_id}/export-3mf` | Parts + colour + filament slot, slicer orca/prusa -> JSON w/ download URL |
+| GET    | `/models/{model_id}/multicolour.3mf` | Download the last multi-colour 3MF exported for the model |
+| GET    | `/models/{model_id}/spiral-wand.zip` | Download every part of a spiral wand / rider build as one zip  |
+| POST   | `/thumbnail`                  | multipart upload (`file`, `size`) -> **a PNG thumbnail**                |
+| POST   | `/tags/suggest`               | `{"file_name": "...", ...}` -> JSON w/ suggested tags + method          |
+| POST   | `/transcribe`                 | multipart upload (`file`, short audio) -> `{"text": "..."}` (local faster-whisper) |
+
+Interactive docs are auto-generated by FastAPI at `/docs` once the service
+is running - `/thicken` shows up there with a file-picker and an
+`amount_mm` field; clicking "Execute" gives you a "Download file" link with
+the result, since the response is the file itself.
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a mounting bracket for a raspberry pi, 60mm", "wall_thickness_mm": 3}'
+```
+
+```bash
+# => {"model_id": "...", "backend": "openscad", ...}
+curl -o bracket.stl http://localhost:8000/models/<model_id>/download
+```
+
+```bash
+curl -X POST http://localhost:8000/models/<model_id>/thicken \
+  -H "Content-Type: application/json" -d '{"amount_mm": 1.5}'
+```
+
+```bash
+# load a file you already have, increase its wall thickness, and save the
+# result directly - one call, no separate download step:
+curl -X POST http://localhost:8000/thicken \
+  -F "file=@my_model.stl" -F "amount_mm=1.5" \
+  -o my_model_thickened.stl
+```
+
+```bash
+# same one-round-trip shape for mold generation - all params optional:
+curl -X POST http://localhost:8000/mold \
+  -F "file=@my_model.stl" -F "clearance_mm=8" \
+  -o my_model_mold.zip
+```
+
+```bash
+# direct-cast mode (no silicone step, 2 parts instead of 4):
+curl -X POST http://localhost:8000/mold \
+  -F "file=@my_model.stl" -F "mode=direct_cast" -F "direct_mold_wall_mm=6" \
+  -o my_model_direct_mold.zip
+```
+
+```bash
+# form-fitting mode (thin contour-hugging skin + support jacket, for
+# organic models a rigid direct_cast mold couldn't release):
+curl -X POST http://localhost:8000/mold \
+  -F "file=@my_model.stl" -F "mode=form_fitting" -F "shell_thickness_mm=3" \
+  -o my_model_form_fitting_mold.zip
+```
+
+```bash
+# hollow-cast mode (rigid outer mold + a core, for casting a hollow
+# vessel as a shell instead of a solid block):
+curl -X POST http://localhost:8000/mold \
+  -F "file=@my_model.stl" -F "mode=hollow_cast" -F "cast_wall_thickness_mm=4" \
+  -o my_model_hollow_cast_mold.zip
+```
+
+```bash
+# split along the model's own X axis instead of Z, offset 2mm toward the
+# max end, and estimate the cast's mass at 1.2 g/cm3 - X-Cavity-Volume-Cm3
+# and X-Estimated-Cast-Mass-G come back as response headers:
+curl -X POST http://localhost:8000/mold \
+  -F "file=@my_model.stl" -F "mode=direct_cast" \
+  -F "parting_axis=x" -F "parting_offset_mm=2" -F "material_density_g_per_cm3=1.2" \
+  -o my_model_direct_mold.zip
+```
+
+## Quick start (Docker, recommended)
+
+The project is Docker-first - OpenSCAD, Blender, and
+FreeCAD are installed inside the image, so there's nothing to set up on
+the host besides Docker itself. Replace `<path-to>` with where you cloned
+the repo.
+
+**Easiest: the launcher**. Double-click `Launch.bat`
+(Windows) or `launch.sh` / `3d-printing-model-prompt.desktop` (Linux), or run:
+
+```bash
+cd <path-to>/3d-printing-model-prompt && python3 launch.py up && python3 launch.py open
+```
+
+`launch.py up` picks free host ports near **8000** (app) and **11434**
+(bundled Ollama), records them in `~/.suite/ports.json` so other suite apps
+don't take them, and starts the stack; `open` opens the browser on the app's
+port. `APP_HOST_PORT` / `OLLAMA_HOST_PORT` in `.env` pin a port, and may
+carry a host IP (`127.0.0.1:8000`), which is kept as written. With
+`OLLAMA_HOST` set to anything but the bundled service, or
+`LLM_PROVIDER=claude`, it starts only the app (`--no-deps app`, Option B
+below); `--host-ollama` / `--bundled-ollama` force either mode. Other
+commands: `status`, `down`, `relocate`. The manual commands below still work:
+without the env vars, compose publishes 8000 and 11434 as before.
+
+**Option A - bundled Ollama container** (default; nothing else to install).
+Leave `OLLAMA_HOST` unset in `.env`: `docker-compose.yml` then points the
+app at `http://ollama:11434` (`OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}`).
+
+Windows (PowerShell):
+
+```powershell
+cd <path-to>\3d-printing-model-prompt; copy .env.example .env; docker compose up --build -d; docker compose exec ollama ollama pull llama3.1
+```
+
+Linux/Mac (bash):
+
+```bash
+cd <path-to>/3d-printing-model-prompt && cp .env.example .env && docker compose up --build -d && docker compose exec ollama ollama pull llama3.1
+```
+
+**Option B - Ollama already running on the host** (native install, or a
+shared GPU box). Skip the bundled container so port `11434` doesn't
+conflict. Edit `.env` first and set `OLLAMA_HOST` (uncomment the
+`host.docker.internal` line in `.env.example`, or use your own port, e.g.
+`http://host.docker.internal:11436`), then start only the app.
+`--no-deps` is required - without it Compose also starts the bundled
+`ollama` service. `OLLAMA_MODEL` must match an installed model tag exactly.
+
+Windows (PowerShell):
+
+```powershell
+cd <path-to>\3d-printing-model-prompt; copy .env.example .env; notepad .env; docker compose up --build -d --no-deps app
+```
+
+Linux/Mac (bash):
+
+```bash
+cd <path-to>/3d-printing-model-prompt && cp .env.example .env && ${EDITOR:-nano} .env && docker compose up --build -d --no-deps app
+```
+
+Then open `http://localhost:8000/` (browser UI), `http://localhost:8000/watertight.html`
+or `http://localhost:8000/docs`, and check `http://localhost:8000/health`
+(`status` is `ok` only when OpenSCAD, Blender and the LLM are all
+available). Stop with `docker compose down` (add `-v` only if you want to
+delete generated models - see TROUBLESHOOTING.md's backup note).
+
+To use the Claude API instead of Ollama, set `LLM_PROVIDER=claude` and
+`ANTHROPIC_API_KEY` in `.env` and start with Option B's `--no-deps app`
+command. Full LLM details: [docs/AI_SETUP.md](docs/AI_SETUP.md).
+
+To build/run the app image alone (bring your own LLM backend):
+
+```bash
+cd <path-to>/3d-printing-model-prompt && docker build -t threedprompt . && docker run --rm -p 8000:8000 --env-file .env -v threedprompt_output:/app/output threedprompt
+```
+
+### Deploying on gpu-server
+
+`gpu-server` below stands for the machine that runs Ollama and this app: use its host name or IP address.
+
+gpu-server runs the same compose file with the host's own Ollama (not the
+bundled service): `.env` there sets
+`OLLAMA_HOST=http://host.docker.internal:11436` and the app is
+(re)deployed with `python3 launch.py up` (it sees `OLLAMA_HOST` and
+starts only the app) or `docker compose up -d --no-deps app` (add `--build`
+after changing code - `src/` is copied into the image, not bind-mounted).
+`extra_hosts: host.docker.internal:host-gateway` in `docker-compose.yml`
+is what lets the container reach the host on native Linux Docker. That
+host's `.env` is not in git.
+
+## Configuration
+
+Every variable is read once in `src/threedprompt/config.py`; defaults below
+are the code's. `.env.example` is the annotated template.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLM_PROVIDER` | `ollama` | `ollama` or `claude` (anything else raises `LLMError`) |
+| `OLLAMA_HOST` | `http://localhost:11434` in code; compose substitutes `http://ollama:11434` when unset | Ollama base URL. Keep it commented out in `.env` for the bundled service |
+| `OLLAMA_MODEL` | `llama3.1` | Must match `ollama list` incl. tag |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | empty / `claude-sonnet-5` | Only when `LLM_PROVIDER=claude` |
+| `LLM_TIMEOUT_SECONDS` | `60` | Per LLM request; raise on a shared GPU |
+| `CLASSIFIER_CONFIDENCE_THRESHOLD` | `0.7` | Below it, the LLM classifies the prompt |
+| `OPENSCAD_BINARY` / `BLENDER_BINARY` / `FREECAD_BINARY` | `openscad` / `blender` / `freecadcmd` | Binary names or full paths |
+| `CAD_SUBPROCESS_TIMEOUT_SECONDS` | `180` | Timeout for each CAD subprocess |
+| `SIMPLE_LLM_BACKEND` | `cadquery` | `cadquery` (sandboxed) or `openscad` for simple prompts with no template |
+| `CADQUERY_MEMORY_LIMIT_MB` | `4096` | Address-space cap for the CadQuery child |
+| `OUTPUT_DIR` | `./output` (`/app/output` in the image) | Model storage |
+| `MAX_PROMPT_LENGTH` | `2000` | Characters |
+| `MAX_UPLOAD_BYTES` | `314572800` (300 MB) | Whole upload is buffered in memory |
+| `MAX_WALL_THICKNESS_MM` | `20.0` | Cap on `amount_mm` |
+| `MAX_MOLD_DIMENSION_MM` | `300.0` | Cap on a mold part's largest side |
+| `THUMBNAIL_MAX_SIZE_PX` | `2048` | Cap on `/thumbnail` `size` |
+| `MAX_AUDIO_UPLOAD_BYTES` | `26214400` (25 MB) | `/transcribe` cap |
+| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` / `WHISPER_MODEL_DIR` | `base.en` / `cpu` / `int8` / blank (= `<OUTPUT_DIR>/whisper-models`) | Local speech-to-text |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | Defined in `config.py` and `.env.example`, but the container always runs `uvicorn ... --host 0.0.0.0 --port 8000` (Dockerfile `CMD`), so they do not change the container's listen port |
+| `LOG_LEVEL` | `INFO` | |
+| `CACHE_ENABLED` | `true` | Identical `(prompt, wall_thickness_mm)` returns the earlier model_id instead of regenerating |
+
+## Further documentation
+
+- [GettingStarted.md](GettingStarted.md) - short quick start
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - components, data flow, storage, deployment
+- [docs/AI_SETUP.md](docs/AI_SETUP.md) - Ollama / Claude setup and verification
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - symptoms, causes, fixes
+- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [CHANGELOG.md](CHANGELOG.md)
+- [Requirements.md](Requirements.md), `docs/adr/` (design decisions)
+
+## Running locally without Docker
+
+Requires OpenSCAD and Blender installed and on `PATH` (or point
+`OPENSCAD_BINARY` / `BLENDER_BINARY` at their full paths). Watertight and
+mold features also need `numpy` available to Blender's Python, and `.3dm`
+input needs `rhino3dm` there too (e.g. `python3 -m pip install rhino3dm`
+for the system Python a distro-packaged Blender uses). FreeCAD
+(`freecadcmd`) is optional - without it, `.stl` thickening falls back to
+Blender automatically and `/step/upload`, `/models/{id}/export-step`,
+`/models/{id}/repair-solid` return 503; point `FREECAD_BINARY` at its
+full path if it isn't on `PATH`. The CadQuery backend needs Linux with
+Landlock; elsewhere `/generate` falls back to OpenSCAD for simple prompts.
+
+`config.py` does not load `.env` itself - only Docker Compose reads it
+automatically - so pass it to uvicorn with `--env-file .env` (and set
+`OLLAMA_HOST=http://localhost:11434` there).
+
+Linux/Mac (bash):
+
+```bash
+cd <path-to>/3d-printing-model-prompt && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements-dev.txt && pip install -e . && cp .env.example .env && uvicorn threedprompt.main:app --reload --env-file .env
+```
+
+Windows (PowerShell; the CAD binaries must be installed and configured as above):
+
+```powershell
+cd <path-to>\3d-printing-model-prompt; python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements-dev.txt; pip install -e .; copy .env.example .env; uvicorn threedprompt.main:app --reload --env-file .env
+```
+
+Run the tests: `pytest` (all CAD/LLM calls are mocked, so this needs neither
+OpenSCAD/Blender nor a running LLM; the `*_integration` tests are skipped
+unless a real Blender is on `PATH`; last run here: 183 passed, 36 skipped).
+Lint/format: `ruff check src tests` and `black --check src tests`.
+
+CI (`.github/workflows/ci.yml`) runs ruff, black, pytest and a Docker build
+on every push/PR; `.github/workflows/security.yml` runs gitleaks (full
+history), pip-audit over the requirements files, and npm audit (a no-op
+here, no `package-lock.json`). `.pre-commit-config.yaml` runs gitleaks
+before commits. The vendored `rhino3dm_reader` is excluded from ruff and
+black in `pyproject.toml` (third-party code, not held to this repo's style).
+
+## AI/LLM backend
+
+Setup and verification: [docs/AI_SETUP.md](docs/AI_SETUP.md). The LLM used for classification fallback and for
+authoring OpenSCAD/`bpy` code is behind a small abstraction
+(`src/threedprompt/llm_client.py`) selected entirely by `LLM_PROVIDER`:
+
+| `LLM_PROVIDER` | Cost         | Notes                                             |
+|-----------------|--------------|----------------------------------------------------|
+| `ollama` (default) | free, local | Requires an Ollama server reachable at `OLLAMA_HOST` running `OLLAMA_MODEL` (default `llama3.1`). |
+| `claude`         | paid API     | Requires `ANTHROPIC_API_KEY`. Generally produces noticeably better organic-shape (Blender) results - see the known limitation above. |
+
+Switching backends is a single env var change; no call sites change.
+
+## Licensing posture
+
+This project is intended to be open source, MIT licensed
+(see `LICENSE`). Runtime dependencies:
+
+| Dependency | License | Notes |
+|---|---|---|
+| FastAPI, Uvicorn, Pydantic, Requests | MIT/BSD | permissive |
+| `anthropic` (Python SDK) | MIT | only used if `LLM_PROVIDER=claude` |
+| `faster-whisper`, `ctranslate2`, `onnxruntime`, `tokenizers`, `huggingface-hub` | MIT / Apache-2.0 | `/transcribe`; Whisper model weights are MIT |
+| `av` (PyAV) | BSD-3-Clause | audio decoding for `/transcribe`; its wheels bundle FFmpeg shared libraries (LGPL) - dynamically linked, keep FFmpeg's notice if redistributing the image |
+| three.js r0.160.0 (vendored, `src/threedprompt/static/vendor/three/`) | MIT | watertight and spiral wand viewers; vendored not CDN-loaded, per rule 4 |
+| `trimesh` | MIT | mesh I/O and light repair for the spiral wand feature |
+| `manifold3d` | Apache-2.0 | in-process mesh booleans and twisted extrusions for the spiral wand feature |
+| `networkx` | BSD-3-Clause | used by trimesh's hole filling |
+| `opencv-python-headless` | Apache-2.0 | photo tracing for the tool insert; its wheels bundle FFmpeg shared libraries (LGPL) - dynamically linked, keep FFmpeg's notice if redistributing the image |
+| `lib3mf` (dev only) | BSD-2-Clause | tests check the exported 3MF files with the 3MF consortium's reference library; not used at runtime |
+| `segno` | BSD-3-Clause | QR code encoding for the QR tag template |
+| Gridfinity (sizes only, no files) | MIT | the 42 mm grid, 7 mm height unit and foot profile in `gridfinity.py` follow Zack Freedman's published spec |
+| import_3dm v0.0.18 reader (vendored, `src/threedprompt/blender_scripts/vendor/rhino3dm_reader/`) | MIT | `.3dm` import inside Blender; license + `NOTICE.md` kept alongside |
+| `rhino3dm` (pip, installed into the image's system Python for Blender) | MIT | only needed for `.3dm` input |
+| OpenSCAD | GPL-2.0 | invoked as an external CLI process (subprocess), not linked into this codebase - GPL applies to OpenSCAD itself, not to this project |
+| Blender | GPL-3.0 | same: invoked as an external headless process, not linked in |
+| FreeCAD | LGPL-2.1 | same: invoked as an external headless process (`freecadcmd`), not linked in - LGPL is weak copyleft and, unlike OpenSCAD/Blender's GPL, wouldn't impose source-disclosure obligations even if linked directly |
+
+**Flagging per rule 7:** OpenSCAD and Blender are themselves GPL-licensed
+(FreeCAD is LGPL-2.1, more permissive). This project only *shells out* to
+their CLI/headless executables (no linking, no bundling of their source
+into this codebase), which does not impose GPL obligations on this
+project's own code - but if you redistribute the Docker image itself
+(which bundles all three binaries), you're redistributing GPL/LGPL
+software and should keep their license notices intact. Confirm this
+arrangement is acceptable before distributing built images.
+
+## Data privacy & backups
+
+This service collects no personal data - only prompts and uploaded mesh
+files, used solely to generate/modify models (rule 17). Generated models
+live under `OUTPUT_DIR` (`./output` by default, a Docker volume in Compose)
+as plain files with no database; there is no automated backup - see
+`TROUBLESHOOTING.md` for the backup/restore note (rule 18).
+
+## Project status
+
+Early stage (`0.1.0`, no tagged releases). See [CONTRIBUTING.md](CONTRIBUTING.md)
+for how to propose changes, and `CHANGELOG.md` for what's shipped and
+`docs/adr/` for the reasoning behind the OpenSCAD/Blender split, the hybrid
+classifier, the wall-thickness strategy, the watertight hole-detection/
+repair feature, the mold-generation feature, and the spiral wand feature. `GettingStarted.md` is the
+short quick start; `Requirements.md` tracks what's built vs. open.
